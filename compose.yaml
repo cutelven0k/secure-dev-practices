@@ -35,6 +35,25 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
+  shop:
+    build: ./shop
+    image: rpzs-shop:1.0.0
+    env_file: ./shop.env
+    volumes:
+      - shop-logs:/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    # интерактивный режим: запуск через docker compose run --rm shop
+    stdin_open: true
+    tty: true
+    profiles: [app]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
 volumes:
   pgdata:
   pinger-logs:
+  shop-logs:
