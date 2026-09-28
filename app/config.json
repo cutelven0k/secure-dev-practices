@@ -1,0 +1,6 @@
+{
+  "host": "127.0.0.1",
+  "port": 55432,
+  "dbname": "practice_db",
+  "connect_timeout": 5
+}
