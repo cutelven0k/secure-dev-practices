@@ -22,5 +22,19 @@ services:
       retries: 10
     restart: unless-stopped
 
+  pinger:
+    build: ./pinger
+    image: rpzs-pinger:1.0.0
+    env_file: ./pinger.env
+    volumes:
+      - pinger-logs:/logs
+    # depends_on специально нет: пингер должен сам переживать недоступную БД
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  pinger-logs:
