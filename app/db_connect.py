@@ -93,9 +93,9 @@ def clear_pg_env():
 
 def connect(cfg, user, password):
     clear_pg_env()
-    # Каждое значение передаётся отдельным именованным параметром.
-    # psycopg собирает из них conninfo сам и экранирует кавычки и пробелы,
-    # поэтому пароль вида  x' host=evil options='-c work_mem=4GB
+    # Защита от инъекции в параметры подключения (connection-string injection):
+    # каждое значение идёт отдельным именованным параметром, conninfo psycopg
+    # собирает и экранирует сам, поэтому пароль  x' host=evil options='-c work_mem=4GB
     # останется просто паролем и не добавит новых параметров.
     return psycopg.connect(
         host=cfg["host"],
