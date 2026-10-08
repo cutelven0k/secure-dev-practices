@@ -377,8 +377,9 @@ def print_rows(cur):
     line = " | ".join(n.ljust(w) for n, w in zip(names, widths))
     print(line)
     print("-" * len(line))
+    # 40 - предел ширины колонки для выравнивания, длинное значение не обрезается
     for r in data:
-        print(" | ".join(v[:w].ljust(w) for v, w in zip(r, widths)))
+        print(" | ".join(v.ljust(w) for v, w in zip(r, widths)))
     log.info("Запрос выполнен, строк: %d", len(rows))
 
 
