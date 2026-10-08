@@ -257,7 +257,9 @@ def choose(title, options, allow_many=False, min_count=1):
         if not s:
             raise InputCancelled
         parts = [p.strip() for p in s.split(",")] if allow_many else [s]
-        if not all(p.isdigit() and 1 <= int(p) <= len(options) for p in parts):
+        # isdigit() пропускает «²» и «①», которые int() не разбирает
+        if not all(p.isascii() and p.isdigit() and 1 <= int(p) <= len(options)
+                   for p in parts):
             print("  Нет такого номера, попробуйте ещё раз")
             continue
         picked = []
@@ -617,6 +619,8 @@ def ask_password(prompt):
             return getpass.getpass(prompt)
         except getpass.GetPassWarning:
             pass
+        except EOFError:
+            raise InputCancelled from None
     print(prompt, end="", flush=True)
     line = sys.stdin.readline()
     if not line:
@@ -655,6 +659,10 @@ def main():
                   "и доступность сервера")
         raw.error("connect: %s: %s", type(e).__name__, str(e).strip())
         return 2
+    except KeyboardInterrupt:
+        print()
+        log.error("подключение отменено")
+        return 1
     log.info("Подключение к базе %s выполнено", cfg["dbname"])
     if not schema.tables:
         log.error("нет доступных таблиц")
