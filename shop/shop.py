@@ -12,20 +12,20 @@ import logging
 import os
 import re
 import sys
+import warnings
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import psycopg
 from psycopg import errors, sql
 
-CONFIG_PATH = Path(os.environ.get("SHOP_CONFIG", Path(__file__).with_name("config.json")))
+# Файл настроек лежит рядом с программой, путь через окружение не меняется
+CONFIG_PATH = Path(__file__).with_name("config.json")
 
 ALLOWED_KEYS = {"host", "port", "dbname", "connect_timeout"}
 REQUIRED_KEYS = {"host", "port", "dbname"}
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
 DBNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
-
-ROW_LIMIT = 100
 
 # Поддерживаемые типы колонок: тип из information_schema -> (приведение в SQL,
 # функция разбора ввода). Приведение берётся только из этого словаря.
@@ -121,10 +121,15 @@ def setup_logging():
     # ошибок БД попал бы в консоль пользователю через обработчики "shop"
     raw.setLevel(logging.INFO)
     raw.propagate = False
+    # без обработчиков logging отдал бы записи raw в stderr (lastResort)
+    raw.addHandler(logging.NullHandler())
 
     log_file = os.environ.get("LOG_FILE", "").strip()
     if log_file:
-        fh = logging.FileHandler(log_file, encoding="utf-8")
+        try:
+            fh = logging.FileHandler(log_file, encoding="utf-8")
+        except OSError:
+            raise ConfigError(f"не удалось открыть файл логов {log_file}") from None
         fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s"))
         log.addHandler(fh)
         raw.addHandler(fh)
@@ -241,7 +246,7 @@ def ask(prompt):
         raise InputCancelled from None
 
 
-def choose(title, options, allow_many=False):
+def choose(title, options, allow_many=False, min_count=1):
     """Выбор из списка по номеру. Возвращает элемент(ы) списка, а не ввод."""
     print(title)
     for i, opt in enumerate(options, 1):
@@ -252,14 +257,18 @@ def choose(title, options, allow_many=False):
         if not s:
             raise InputCancelled
         parts = [p.strip() for p in s.split(",")] if allow_many else [s]
-        if all(p.isdigit() and 1 <= int(p) <= len(options) for p in parts):
-            picked = []
-            for p in parts:
-                item = options[int(p) - 1]
-                if item not in picked:
-                    picked.append(item)
-            return picked if allow_many else picked[0]
-        print("  Нет такого номера, попробуйте ещё раз")
+        if not all(p.isdigit() and 1 <= int(p) <= len(options) for p in parts):
+            print("  Нет такого номера, попробуйте ещё раз")
+            continue
+        picked = []
+        for p in parts:
+            item = options[int(p) - 1]
+            if item not in picked:
+                picked.append(item)
+        if len(picked) < min_count:
+            print(f"  Нужно выбрать не меньше {min_count} разных номеров")
+            continue
+        return picked if allow_many else picked[0]
 
 
 def parse_value(col, text):
@@ -368,17 +377,16 @@ def print_rows(cur):
     print("-" * len(line))
     for r in data:
         print(" | ".join(v[:w].ljust(w) for v, w in zip(r, widths)))
-    log.info("Запрос выполнен, строк: %d%s", len(rows),
-             f" (показаны первые {ROW_LIMIT})" if len(rows) == ROW_LIMIT else "")
+    log.info("Запрос выполнен, строк: %d", len(rows))
 
 
 # ---------- операции ----------
 
 def select_all(conn, schema):
     table = choose("Таблица:", list(schema.tables))
-    q = sql.SQL("SELECT * FROM {} ORDER BY 1 LIMIT %s").format(sql.Identifier(table))
+    q = sql.SQL("SELECT * FROM {} ORDER BY 1").format(sql.Identifier(table))
     with conn.cursor() as cur:
-        cur.execute(q, (ROW_LIMIT,))
+        cur.execute(q)
         print_rows(cur)
 
 
@@ -386,7 +394,7 @@ def select_filtered(conn, schema, many):
     table = choose("Таблица:", list(schema.tables))
     cols = schema.columns(table)
     if many:
-        picked = choose("Колонки для фильтра:", cols, allow_many=True)
+        picked = choose("Колонки для фильтра (не меньше двух):", cols, allow_many=True, min_count=2)
     else:
         picked = [choose("Колонка для фильтра:", cols)]
     print("Значения для фильтра:")
@@ -394,10 +402,9 @@ def select_filtered(conn, schema, many):
     where = sql.SQL(" AND ").join(
         sql.SQL("{} = {}").format(sql.Identifier(c.name), ph(c)) for c in picked
     )
-    q = sql.SQL("SELECT * FROM {} WHERE {} ORDER BY 1 LIMIT %s").format(
-        sql.Identifier(table), where)
+    q = sql.SQL("SELECT * FROM {} WHERE {} ORDER BY 1").format(sql.Identifier(table), where)
     with conn.cursor() as cur:
-        cur.execute(q, (*values, ROW_LIMIT))
+        cur.execute(q, values)
         print_rows(cur)
 
 
@@ -431,12 +438,13 @@ def update_many(conn, schema):
     value = ask_value(target, allow_empty=target.nullable)
     key = choose("По какой колонке отбирать записи:", schema.columns(table))
     keys = ask_values_list(key)
-    # список значений для IN передаётся одним параметром-массивом
-    q = sql.SQL("UPDATE {} SET {} = {} WHERE {} = ANY({})").format(
+    # в IN по плейсхолдеру на каждое значение списка: IN (%s, %s, ...),
+    # сами значения уходят параметрами
+    q = sql.SQL("UPDATE {} SET {} = {} WHERE {} IN ({})").format(
         sql.Identifier(table), sql.Identifier(target.name), ph(target),
-        sql.Identifier(key.name), ph_array(key))
+        sql.Identifier(key.name), sql.SQL(", ").join(ph(key) for _ in keys))
     with conn.transaction(), conn.cursor() as cur:
-        cur.execute(q, (value, keys))
+        cur.execute(q, (value, *keys))
         n = cur.rowcount
     log.info("Обновлено записей в таблице %s: %d", table, n)
 
@@ -599,8 +607,30 @@ MENU = [
 ]
 
 
+def ask_password(prompt):
+    """Скрытый ввод пароля. Без терминала (ввод из канала, docker compose run -T)
+    getpass печатает предупреждение Python; там эхо и так не видно, пароль
+    читается строкой из stdin."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            return getpass.getpass(prompt)
+        except getpass.GetPassWarning:
+            pass
+    print(prompt, end="", flush=True)
+    line = sys.stdin.readline()
+    if not line:
+        raise InputCancelled
+    print()
+    return line.removesuffix("\n")
+
+
 def main():
-    setup_logging()
+    try:
+        setup_logging()
+    except ConfigError as e:
+        log.error("%s", e)
+        return 1
     try:
         cfg = load_config()
     except ConfigError as e:
@@ -609,7 +639,7 @@ def main():
 
     try:
         user = ask("Логин: ").strip()
-        password = getpass.getpass("Пароль: ")
+        password = ask_password("Пароль: ")
     except (InputCancelled, KeyboardInterrupt):
         log.error("ввод отменён")
         return 1
