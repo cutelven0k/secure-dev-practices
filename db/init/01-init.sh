@@ -19,6 +19,9 @@ CREATE DATABASE :"db_name"
 -- по умолчанию CONNECT к новой базе есть у всех (PUBLIC), убираем
 REVOKE ALL ON DATABASE :"db_name" FROM PUBLIC;
 GRANT CONNECT ON DATABASE :"db_name" TO :"db_user";
+-- то же умолчание действует для системных баз postgres и template1;
+-- суперпользователю это право не нужно, приложению эти базы не нужны
+REVOKE ALL ON DATABASE postgres, template1 FROM PUBLIC;
 
 \connect :"db_name"
 REVOKE ALL ON SCHEMA public FROM PUBLIC;
