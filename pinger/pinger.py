@@ -3,10 +3,12 @@
 Раз в PING_INTERVAL_SECONDS секунд (по умолчанию 300) подключается к базе
 и запрашивает версию. Успех пишется в stdout, ошибка в stderr.
 Адрес базы берётся из config.json, логин и пароль из переменных окружения.
+Каждая проверка идёт в дочернем процессе и ограничена по времени целиком.
 """
 
 import json
 import logging
+import multiprocessing
 import os
 import re
 import signal
@@ -17,18 +19,21 @@ from pathlib import Path
 
 import psycopg
 
-CONFIG_PATH = Path(os.environ.get("PINGER_CONFIG", Path(__file__).with_name("config.json")))
+CONFIG_PATH = Path(__file__).with_name("config.json")
 
-ALLOWED_KEYS = {"host", "port", "dbname", "connect_timeout"}
+ALLOWED_KEYS = {"host", "port", "dbname", "connect_timeout", "check_timeout"}
 REQUIRED_KEYS = {"host", "port", "dbname"}
 HOST_RE = re.compile(r"^[A-Za-z0-9.\-]{1,253}$")
 DBNAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 
-# Так начинается нормальный ответ SELECT version(), например
+QUERY = "SELECT VERSION();"
+
+# Шаблон типичного ответа на QUERY, например
 # "PostgreSQL 18.6 (Debian 18.6-1.pgdg12+1) on x86_64-pc-linux-gnu, ..."
-VERSION_RE = re.compile(r"^PostgreSQL \d+(\.\d+)?\b.* on \S+")
+VERSION_RE = re.compile(r"^PostgreSQL 18\.\d+\b.* on \S+")
 
 DEFAULT_INTERVAL = 300
+DEFAULT_CHECK_TIMEOUT = 20
 
 log = logging.getLogger("pinger")
 stop_event = threading.Event()
@@ -60,6 +65,7 @@ def load_config(path=CONFIG_PATH):
 
     host, port, dbname = data["host"], data["port"], data["dbname"]
     timeout = data.get("connect_timeout", 5)
+    check_timeout = data.get("check_timeout", DEFAULT_CHECK_TIMEOUT)
     if not isinstance(host, str) or not HOST_RE.match(host):
         raise ConfigError("неверное значение host")
     if type(port) is not int or not 1 <= port <= 65535:
@@ -68,7 +74,10 @@ def load_config(path=CONFIG_PATH):
         raise ConfigError("неверное значение dbname")
     if type(timeout) is not int or not 1 <= timeout <= 60:
         raise ConfigError("connect_timeout должен быть числом от 1 до 60")
-    return {"host": host, "port": port, "dbname": dbname, "connect_timeout": timeout}
+    if type(check_timeout) is not int or not 1 <= check_timeout <= 120:
+        raise ConfigError("check_timeout должен быть числом от 1 до 120")
+    return {"host": host, "port": port, "dbname": dbname,
+            "connect_timeout": timeout, "check_timeout": check_timeout}
 
 
 def load_env():
@@ -120,7 +129,9 @@ def setup_logging(log_file):
         log.addHandler(fh)
 
 
-def check_once(cfg, user, password):
+def probe(cfg, user, password):
+    """Одна проверка: подключение, запрос, сравнение с шаблоном.
+    Возвращает (уровень, текст), сама в журнал не пишет."""
     try:
         with psycopg.connect(
             host=cfg["host"],
@@ -142,19 +153,66 @@ def check_once(cfg, user, password):
             keepalives_count=3,
             tcp_user_timeout=cfg["connect_timeout"] * 1000,
         ) as conn:
-            row = conn.execute("SELECT version()").fetchone()
+            row = conn.execute(QUERY).fetchone()
     except psycopg.Error as e:
-        log.error("БД недоступна: %s", str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__)
-        return
+        text = str(e).strip()
+        return logging.ERROR, "БД недоступна: " + (text.splitlines()[0] if text else type(e).__name__)
     except OSError as e:
-        log.error("БД недоступна: ошибка сети: %s", e)
-        return
+        return logging.ERROR, f"БД недоступна: ошибка сети: {e}"
 
     version = row[0] if row else None
     if isinstance(version, str) and VERSION_RE.match(version):
-        log.info("БД доступна: %s", version)
-    else:
-        log.warning("БД ответила, но ответ нетипичный: %r", version)
+        return logging.INFO, f"БД доступна: {version}"
+    return logging.WARNING, f"БД ответила, но ответ нетипичный: {version!r}"
+
+
+def probe_in_child(conn, cfg, user, password):
+    # сигналы остановки получает и обрабатывает родитель
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    try:
+        result = probe(cfg, user, password)
+    except Exception as e:
+        result = logging.ERROR, f"непредвиденная ошибка при проверке: {e!r}"
+    try:
+        conn.send(result)
+    finally:
+        # без обработчиков atexit и сброса буферов, унаследованных от родителя
+        os._exit(0)
+
+
+def check_once(cfg, user, password, limit):
+    """Проверка в дочернем процессе, не дольше limit секунд.
+
+    connect_timeout не покрывает разрешение имени и ответ на сам запрос,
+    а поток с зависшим вызовом libpq не прервать. Процесс можно убить."""
+    ctx = multiprocessing.get_context("fork")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=probe_in_child, args=(child_conn, cfg, user, password))
+    proc.start()
+    child_conn.close()
+    deadline = time.monotonic() + limit
+    try:
+        # ждём отрезками, чтобы между ними заметить SIGTERM
+        while not stop_event.is_set():
+            left = deadline - time.monotonic()
+            if left <= 0:
+                log.error("БД не ответила за %g с", limit)
+                return
+            if parent_conn.poll(min(0.5, left)):
+                try:
+                    level, text = parent_conn.recv()
+                except EOFError:
+                    log.error("проверка завершилась без результата")
+                    return
+                log.log(level, "%s", text)
+                return
+    finally:
+        parent_conn.close()
+        if proc.is_alive():
+            proc.kill()
+        # забираем потомка, иначе под PID 1 копились бы зомби
+        proc.join()
 
 
 received_signal = None
@@ -189,13 +247,15 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    log.info("пингер запущен: %s:%s/%s, интервал %s с",
-             cfg["host"], cfg["port"], cfg["dbname"], interval)
+    # проверка всегда короче интервала, чтобы не сдвигать следующую
+    limit = min(cfg["check_timeout"], 0.8 * interval)
+    log.info("пингер запущен: %s:%s/%s, интервал %s с, предел проверки %g с",
+             cfg["host"], cfg["port"], cfg["dbname"], interval, limit)
 
     next_run = time.monotonic()
     while not stop_event.is_set():
         try:
-            check_once(cfg, user, password)
+            check_once(cfg, user, password, limit)
         except Exception:
             # что бы ни случилось в проверке, следующая всё равно будет
             log.exception("непредвиденная ошибка при проверке")
