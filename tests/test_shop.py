@@ -478,11 +478,11 @@ def test_update_many_text_values_stay_parameters(monkeypatch, schema, values):
     conn = FakeConn([Result(rowcount=0)])
     shop.update_many(conn, schema)
     assert list(conn.params) == [0, *values]
-    assert conn.query.count("%s") == len(values) + 1
-    for v in values:
-        if v != "%s":
-            assert v not in conn.query
-    assert re.fullmatch(r'UPDATE "books" SET "stock" = %s::int4 WHERE "title" IN \((%s::text, )*%s::text\)', conn.query)
+    # Текст запроса — ровно шаблон из идентификаторов и плейсхолдеров: значения
+    # в него не попадают ни целиком, ни частями. Сверка по подстроке не годится:
+    # кавычка и «%s» есть в самом шаблоне.
+    placeholders = ", ".join(["%s::text"] * len(values))
+    assert conn.query == f'UPDATE "books" SET "stock" = %s::int4 WHERE "title" IN ({placeholders})', conn.query
 
 
 def test_update_many_reports_rows_count(monkeypatch, capsys, schema):
